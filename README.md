@@ -92,6 +92,8 @@ powershell -ExecutionPolicy Bypass -File .\Repair-CodexDesktop.ps1 -NoAdminLaunc
     saved under the run backup's `conflicts` directory
   - rebuilds `session_index.jsonl` from `state_5.sqlite` after the merge so
     recovered chats are visible in the Desktop sidebar
+- Writes repaired TOML/JSON/JSONL state files as UTF-8 without BOM so strict
+  Codex parsers do not reject the first key/line.
 - Rewrites stale local runtime paths inside isolated config/native-host files.
 - Creates Desktop and Start Menu shortcuts:
   - `Codex Desktop (Isolated)`

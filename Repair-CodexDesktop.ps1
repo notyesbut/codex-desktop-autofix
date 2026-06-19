@@ -268,6 +268,30 @@ function New-Directory {
     }
 }
 
+function Set-Utf8NoBomContent {
+    param(
+        [string]$Path,
+        [AllowNull()][object]$Value
+    )
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    if ($null -eq $Value) {
+        [System.IO.File]::WriteAllText($Path, '', $utf8NoBom)
+        return
+    }
+
+    if ($Value -is [string]) {
+        [System.IO.File]::WriteAllLines($Path, [string[]]@($Value), $utf8NoBom)
+        return
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @($Value)) {
+        [void]$lines.Add([string]$item)
+    }
+    [System.IO.File]::WriteAllLines($Path, [string[]]$lines.ToArray(), $utf8NoBom)
+}
+
 function Copy-IfExists {
     param(
         [string]$Source,
@@ -361,7 +385,7 @@ function New-Backup {
             CODEX_SQLITE_HOME = [Environment]::GetEnvironmentVariable('CODEX_SQLITE_HOME', 'User')
             UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         }
-        $envSnapshot | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $backup 'user-env-snapshot.json') -Encoding UTF8
+        Set-Utf8NoBomContent -Path (Join-Path $backup 'user-env-snapshot.json') -Value ($envSnapshot | ConvertTo-Json -Depth 4)
     }
 
     return $backup
@@ -521,7 +545,7 @@ function Merge-JsonlStateFile {
         if ($added -gt 0) {
             Copy-ConflictSnapshot -Source $Destination -SourceRoot $DestinationRoot -ConflictRoot $ConflictRoot -Tag 'isolated-before-jsonl-merge'
             if ($PSCmdlet.ShouldProcess($Destination, "merge $added JSONL history lines from $Source")) {
-                Set-Content -LiteralPath $Destination -Value $merged.ToArray() -Encoding UTF8
+                Set-Utf8NoBomContent -Path $Destination -Value $merged.ToArray()
             }
         }
     } catch {
@@ -1035,13 +1059,13 @@ function Initialize-CodexHome {
     $configPath = Join-Path $NewCodexHome 'config.toml'
     if (-not (Test-Path -LiteralPath $configPath)) {
         if ($PSCmdlet.ShouldProcess($configPath, 'create minimal config.toml')) {
-            Set-Content -LiteralPath $configPath -Value @(
+            Set-Utf8NoBomContent -Path $configPath -Value @(
                 'approvals_reviewer = "user"',
                 '',
                 '[desktop]',
                 'runCodexInWindowsSubsystemForLinux = false',
                 'integratedTerminalShell = "powershell"'
-            ) -Encoding UTF8
+            )
         }
     }
 }
@@ -1094,7 +1118,7 @@ function Repair-CodexConfig {
     $lines = Remove-TomlSectionKey -Lines $lines -Section 'mcp_servers.node_repl.env' -Key 'SKY_CUA_NATIVE_PIPE_DIRECTORY'
 
     if ($PSCmdlet.ShouldProcess($ConfigPath, 'write repaired config.toml')) {
-        Set-Content -LiteralPath $ConfigPath -Value $lines -Encoding UTF8
+        Set-Utf8NoBomContent -Path $ConfigPath -Value $lines
     }
 }
 
@@ -1151,7 +1175,7 @@ function Repair-CodexPermissionState {
             }
 
             if ($PSCmdlet.ShouldProcess($statePath, 'write full-access Codex permission state')) {
-                $json | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $statePath -Encoding UTF8
+                Set-Utf8NoBomContent -Path $statePath -Value ($json | ConvertTo-Json -Depth 100)
             }
         } catch {
             Write-WarnLine "Could not repair Codex permission state ${statePath}: $($_.Exception.Message)"
@@ -1238,7 +1262,7 @@ function Repair-NativeHostJson {
             $json = $raw | ConvertFrom-Json
             Update-JsonNode -Node $json -Paths $paths
             if ($PSCmdlet.ShouldProcess($jsonPath, 'repair native host JSON paths')) {
-                $json | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+                Set-Utf8NoBomContent -Path $jsonPath -Value ($json | ConvertTo-Json -Depth 32)
             }
         } catch {
             Write-WarnLine "Could not repair JSON ${jsonPath}: $($_.Exception.Message)"
