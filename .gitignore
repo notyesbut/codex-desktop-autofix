@@ -1,0 +1,14 @@
+.idea/
+.vscode/
+*.log
+*.tmp
+*.bak
+*.before_*
+backup/
+backups/
+artifacts/
+*.reg
+auth.json
+*.db
+*.sqlite
+*.sqlite3
