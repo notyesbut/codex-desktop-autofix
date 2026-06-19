@@ -7,6 +7,9 @@ param(
     [switch]$RestartExisting,
     [switch]$GpuSafe,
     [switch]$NoShortcuts,
+    [switch]$NoAdminShortcuts,
+    [switch]$KeepCodexPermissions,
+    [switch]$NoStateSync,
     [switch]$SelfTest
 )
 
@@ -196,6 +199,16 @@ function Remove-TomlSectionKey {
     return $result.ToArray()
 }
 
+function Set-ObjectProperty {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [object]$Value
+    )
+
+    $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+}
+
 function Invoke-SelfTest {
     Write-Step 'Running TOML helper self-test'
     $sample = @(
@@ -217,8 +230,12 @@ function Invoke-SelfTest {
     )
 
     $lines = Remove-TomlSection -Lines $sample -Section 'marketplaces.openai-bundled'
+    $lines = Set-TomlTopLevelKey -Lines $lines -Key 'approval_policy' -Value '"never"'
+    $lines = Set-TomlTopLevelKey -Lines $lines -Key 'sandbox_mode' -Value '"danger-full-access"'
+    $lines = Set-TomlTopLevelKey -Lines $lines -Key 'default_permissions' -Value '":danger-full-access"'
     $lines = Set-TomlSectionKey -Lines $lines -Section 'desktop' -Key 'runCodexInWindowsSubsystemForLinux' -Value 'false'
     $lines = Set-TomlSectionKey -Lines $lines -Section 'desktop' -Key 'integratedTerminalShell' -Value '"powershell"'
+    $lines = Set-TomlSectionKey -Lines $lines -Section 'windows' -Key 'sandbox' -Value '"unelevated"'
     $lines = Set-TomlSectionKey -Lines $lines -Section 'mcp_servers.node_repl.env' -Key 'CODEX_HOME' -Value (Convert-ToTomlLiteral 'C:\Users\test\Apps\CodexDesktop\data\CodexHome')
     $lines = Remove-TomlSectionKey -Lines $lines -Section 'mcp_servers.node_repl.env' -Key 'SKY_CUA_NATIVE_PIPE_DIRECTORY'
     $text = $lines -join "`n"
@@ -226,8 +243,12 @@ function Invoke-SelfTest {
     $checks = @(
         @{ Name = 'bundled section removed'; Pass = ($text -notmatch '\[marketplaces\.openai-bundled\]') },
         @{ Name = 'primary runtime preserved'; Pass = ($text -match '\[marketplaces\.openai-primary-runtime\]') },
+        @{ Name = 'approval bypass set'; Pass = ($text -match 'approval_policy = "never"') },
+        @{ Name = 'danger full access set'; Pass = ($text -match 'sandbox_mode = "danger-full-access"') },
+        @{ Name = 'default permission profile set'; Pass = ($text -match 'default_permissions = ":danger-full-access"') },
         @{ Name = 'wsl disabled'; Pass = ($text -match 'runCodexInWindowsSubsystemForLinux = false') },
         @{ Name = 'powershell terminal set'; Pass = ($text -match 'integratedTerminalShell = "powershell"') },
+        @{ Name = 'windows sandbox updater avoided'; Pass = ($text -match '\[windows\]' -and $text -match 'sandbox = "unelevated"') },
         @{ Name = 'stale pipe removed'; Pass = ($text -notmatch 'SKY_CUA_NATIVE_PIPE_DIRECTORY') }
     )
 
@@ -345,6 +366,378 @@ function New-Backup {
     return $backup
 }
 
+function Get-RelativePathCompat {
+    param(
+        [string]$BasePath,
+        [string]$Path
+    )
+
+    try {
+        $baseFull = [System.IO.Path]::GetFullPath($BasePath).TrimEnd('\') + '\'
+        $pathFull = [System.IO.Path]::GetFullPath($Path)
+        $baseUri = New-Object System.Uri($baseFull)
+        $pathUri = New-Object System.Uri($pathFull)
+        return ([System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($pathUri).ToString()) -replace '/', '\')
+    } catch {
+        return (($Path -replace '^[A-Za-z]:\\?', '') -replace '[:*?"<>|]', '_')
+    }
+}
+
+function Test-SameFileContent {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    if (-not (Test-Path -LiteralPath $Left) -or -not (Test-Path -LiteralPath $Right)) {
+        return $false
+    }
+
+    try {
+        $leftInfo = Get-Item -LiteralPath $Left
+        $rightInfo = Get-Item -LiteralPath $Right
+        if ($leftInfo.Length -ne $rightInfo.Length) {
+            return $false
+        }
+        return ((Get-FileHash -LiteralPath $Left -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $Right -Algorithm SHA256).Hash)
+    } catch {
+        return $false
+    }
+}
+
+function Copy-ConflictSnapshot {
+    param(
+        [string]$Source,
+        [string]$SourceRoot,
+        [string]$ConflictRoot,
+        [string]$Tag
+    )
+
+    if (-not (Test-Path -LiteralPath $Source)) {
+        return
+    }
+
+    $relative = Get-RelativePathCompat -BasePath $SourceRoot -Path $Source
+    $destination = Join-Path (Join-Path $ConflictRoot $Tag) $relative
+    $destinationDir = Split-Path -Parent $destination
+    New-Directory -Path $destinationDir
+
+    if ($PSCmdlet.ShouldProcess($destination, "write conflict copy from $Source")) {
+        Copy-Item -LiteralPath $Source -Destination $destination -Force
+    }
+}
+
+function Copy-StateFileWithConflict {
+    param(
+        [string]$Source,
+        [string]$SourceRoot,
+        [string]$Destination,
+        [string]$DestinationRoot,
+        [string]$ConflictRoot,
+        [string]$SourceTag
+    )
+
+    if (-not (Test-Path -LiteralPath $Source)) {
+        return
+    }
+
+    $destinationDir = Split-Path -Parent $Destination
+    New-Directory -Path $destinationDir
+
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        if ($PSCmdlet.ShouldProcess($Destination, "copy state file from $Source")) {
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        }
+        return
+    }
+
+    if (Test-SameFileContent -Left $Source -Right $Destination) {
+        return
+    }
+
+    $sourceInfo = Get-Item -LiteralPath $Source
+    $destinationInfo = Get-Item -LiteralPath $Destination
+    if ($sourceInfo.LastWriteTimeUtc -gt $destinationInfo.LastWriteTimeUtc) {
+        Copy-ConflictSnapshot -Source $Destination -SourceRoot $DestinationRoot -ConflictRoot $ConflictRoot -Tag 'isolated-overwritten'
+        if ($PSCmdlet.ShouldProcess($Destination, "replace older state file with $Source")) {
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        }
+    } else {
+        Copy-ConflictSnapshot -Source $Source -SourceRoot $SourceRoot -ConflictRoot $ConflictRoot -Tag $SourceTag
+    }
+}
+
+function Merge-JsonlStateFile {
+    param(
+        [string]$Source,
+        [string]$SourceRoot,
+        [string]$Destination,
+        [string]$DestinationRoot,
+        [string]$ConflictRoot,
+        [string]$SourceTag
+    )
+
+    if (-not (Test-Path -LiteralPath $Source)) {
+        return
+    }
+
+    $destinationDir = Split-Path -Parent $Destination
+    New-Directory -Path $destinationDir
+
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        if ($PSCmdlet.ShouldProcess($Destination, "copy JSONL history from $Source")) {
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        }
+        return
+    }
+
+    try {
+        $destinationLines = @(Get-Content -LiteralPath $Destination -ErrorAction Stop)
+        $sourceLines = @(Get-Content -LiteralPath $Source -ErrorAction Stop)
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($line in $destinationLines) {
+            if ($null -ne $line -and $line.Trim() -ne '') {
+                [void]$seen.Add($line)
+            }
+        }
+
+        $merged = New-Object System.Collections.Generic.List[string]
+        foreach ($line in $destinationLines) {
+            [void]$merged.Add($line)
+        }
+
+        $added = 0
+        foreach ($line in $sourceLines) {
+            if ($null -eq $line -or $line.Trim() -eq '') {
+                continue
+            }
+            if ($seen.Add($line)) {
+                [void]$merged.Add($line)
+                $added++
+            }
+        }
+
+        if ($added -gt 0) {
+            Copy-ConflictSnapshot -Source $Destination -SourceRoot $DestinationRoot -ConflictRoot $ConflictRoot -Tag 'isolated-before-jsonl-merge'
+            if ($PSCmdlet.ShouldProcess($Destination, "merge $added JSONL history lines from $Source")) {
+                Set-Content -LiteralPath $Destination -Value $merged.ToArray() -Encoding UTF8
+            }
+        }
+    } catch {
+        Write-WarnLine "Could not merge JSONL state ${Source}: $($_.Exception.Message)"
+        Copy-StateFileWithConflict -Source $Source -SourceRoot $SourceRoot -Destination $Destination -DestinationRoot $DestinationRoot -ConflictRoot $ConflictRoot -SourceTag $SourceTag
+    }
+}
+
+function Sync-StateDirectory {
+    param(
+        [string]$SourceRoot,
+        [string]$DestinationRoot,
+        [string]$RelativeDirectory,
+        [string]$ConflictRoot,
+        [string]$SourceTag
+    )
+
+    $sourceDirectory = Join-Path $SourceRoot $RelativeDirectory
+    if (-not (Test-Path -LiteralPath $sourceDirectory)) {
+        return
+    }
+
+    $files = @(Get-ChildItem -LiteralPath $sourceDirectory -Recurse -File -Force -ErrorAction SilentlyContinue)
+    foreach ($file in $files) {
+        $relative = Get-RelativePathCompat -BasePath $SourceRoot -Path $file.FullName
+        $destination = Join-Path $DestinationRoot $relative
+        if ($file.Extension -ieq '.jsonl') {
+            Merge-JsonlStateFile -Source $file.FullName -SourceRoot $SourceRoot -Destination $destination -DestinationRoot $DestinationRoot -ConflictRoot $ConflictRoot -SourceTag $SourceTag
+        } else {
+            Copy-StateFileWithConflict -Source $file.FullName -SourceRoot $SourceRoot -Destination $destination -DestinationRoot $DestinationRoot -ConflictRoot $ConflictRoot -SourceTag $SourceTag
+        }
+    }
+}
+
+function Get-SqliteSetInfo {
+    param(
+        [string]$Root,
+        [string]$DatabaseName,
+        [string]$Tag
+    )
+
+    $main = Join-Path $Root $DatabaseName
+    if (-not (Test-Path -LiteralPath $main)) {
+        return $null
+    }
+
+    $paths = @($main, "$main-wal", "$main-shm") | Where-Object { Test-Path -LiteralPath $_ }
+    $items = @($paths | ForEach-Object { Get-Item -LiteralPath $_ })
+    $latest = ($items | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
+    $totalBytes = ($items | Measure-Object -Property Length -Sum).Sum
+
+    [pscustomobject]@{
+        Root = $Root
+        DatabaseName = $DatabaseName
+        Tag = $Tag
+        Paths = $paths
+        Latest = $latest
+        TotalBytes = [int64]$totalBytes
+    }
+}
+
+function Get-SqliteSetSignature {
+    param(
+        [string]$Root,
+        [string]$DatabaseName
+    )
+
+    $main = Join-Path $Root $DatabaseName
+    $paths = @($main, "$main-wal", "$main-shm")
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($path in $paths) {
+        if (-not (Test-Path -LiteralPath $path)) {
+            [void]$parts.Add("$([System.IO.Path]::GetFileName($path)):missing")
+            continue
+        }
+        try {
+            $item = Get-Item -LiteralPath $path
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            [void]$parts.Add("$([System.IO.Path]::GetFileName($path)):$($item.Length):$hash")
+        } catch {
+            [void]$parts.Add("$([System.IO.Path]::GetFileName($path)):unreadable")
+        }
+    }
+    return ($parts -join '|')
+}
+
+function Copy-SqliteSetToConflict {
+    param(
+        [string]$Root,
+        [string]$DatabaseName,
+        [string]$ConflictRoot,
+        [string]$Tag
+    )
+
+    $main = Join-Path $Root $DatabaseName
+    foreach ($path in @($main, "$main-wal", "$main-shm")) {
+        if (Test-Path -LiteralPath $path) {
+            Copy-ConflictSnapshot -Source $path -SourceRoot $Root -ConflictRoot $ConflictRoot -Tag $Tag
+        }
+    }
+}
+
+function Copy-SqliteSet {
+    param(
+        [string]$SourceRoot,
+        [string]$DestinationRoot,
+        [string]$DatabaseName
+    )
+
+    $sourceMain = Join-Path $SourceRoot $DatabaseName
+    $destinationMain = Join-Path $DestinationRoot $DatabaseName
+    New-Directory -Path $DestinationRoot
+
+    foreach ($source in @($sourceMain, "$sourceMain-wal", "$sourceMain-shm")) {
+        $destination = Join-Path $DestinationRoot ([System.IO.Path]::GetFileName($source))
+        if (Test-Path -LiteralPath $source) {
+            if ($PSCmdlet.ShouldProcess($destination, "copy SQLite state file from $source")) {
+                Copy-Item -LiteralPath $source -Destination $destination -Force
+            }
+        } elseif (Test-Path -LiteralPath $destination) {
+            if ($PSCmdlet.ShouldProcess($destination, 'remove stale SQLite sidecar')) {
+                Remove-Item -LiteralPath $destination -Force
+            }
+        }
+    }
+}
+
+function Sync-SqliteStateDatabase {
+    param(
+        [object[]]$SourceRoots,
+        [string]$DestinationRoot,
+        [string]$DatabaseName,
+        [string]$ConflictRoot
+    )
+
+    $candidateInfos = New-Object System.Collections.Generic.List[object]
+    foreach ($source in $SourceRoots) {
+        $info = Get-SqliteSetInfo -Root $source.Root -DatabaseName $DatabaseName -Tag $source.Tag
+        if ($null -ne $info) {
+            [void]$candidateInfos.Add($info)
+        }
+    }
+
+    $destinationInfo = Get-SqliteSetInfo -Root $DestinationRoot -DatabaseName $DatabaseName -Tag 'isolated'
+    if ($null -ne $destinationInfo) {
+        [void]$candidateInfos.Add($destinationInfo)
+    }
+
+    if ($candidateInfos.Count -eq 0) {
+        return
+    }
+
+    $winner = $candidateInfos | Sort-Object Latest, TotalBytes -Descending | Select-Object -First 1
+    $destinationSignature = Get-SqliteSetSignature -Root $DestinationRoot -DatabaseName $DatabaseName
+
+    foreach ($candidate in $candidateInfos) {
+        if ($candidate.Root -eq $winner.Root) {
+            continue
+        }
+        $candidateSignature = Get-SqliteSetSignature -Root $candidate.Root -DatabaseName $DatabaseName
+        if ($candidateSignature -ne $destinationSignature) {
+            Copy-SqliteSetToConflict -Root $candidate.Root -DatabaseName $DatabaseName -ConflictRoot $ConflictRoot -Tag "$($candidate.Tag)-sqlite-conflict"
+        }
+    }
+
+    if ($winner.Root -ne $DestinationRoot) {
+        $winnerSignature = Get-SqliteSetSignature -Root $winner.Root -DatabaseName $DatabaseName
+        if ($winnerSignature -ne $destinationSignature) {
+            if ($null -ne $destinationInfo) {
+                Copy-SqliteSetToConflict -Root $DestinationRoot -DatabaseName $DatabaseName -ConflictRoot $ConflictRoot -Tag 'isolated-sqlite-overwritten'
+            }
+            Copy-SqliteSet -SourceRoot $winner.Root -DestinationRoot $DestinationRoot -DatabaseName $DatabaseName
+        }
+    }
+}
+
+function Sync-CodexState {
+    param(
+        [string]$OldCodexHome,
+        [string]$NewCodexHome,
+        [string]$Backup
+    )
+
+    if ($NoStateSync) {
+        Write-WarnLine 'Skipping history/SQLite sync because -NoStateSync was provided'
+        return
+    }
+
+    $conflictRoot = Join-Path $Backup 'conflicts'
+    Write-Step 'Syncing Codex history and SQLite state into isolated Codex home'
+
+    $sourceRoots = @(
+        [pscustomobject]@{ Root = $OldCodexHome; Tag = 'legacy-home' },
+        [pscustomobject]@{ Root = (Join-Path $OldCodexHome 'sqlite'); Tag = 'legacy-sqlite-dir' }
+    ) | Where-Object { Test-Path -LiteralPath $_.Root }
+
+    foreach ($source in $sourceRoots) {
+        foreach ($file in @('history.jsonl', 'session_index.jsonl')) {
+            Merge-JsonlStateFile -Source (Join-Path $source.Root $file) -SourceRoot $source.Root -Destination (Join-Path $NewCodexHome $file) -DestinationRoot $NewCodexHome -ConflictRoot $conflictRoot -SourceTag $source.Tag
+        }
+
+        foreach ($file in @('external_agent_session_imports.json')) {
+            Copy-StateFileWithConflict -Source (Join-Path $source.Root $file) -SourceRoot $source.Root -Destination (Join-Path $NewCodexHome $file) -DestinationRoot $NewCodexHome -ConflictRoot $conflictRoot -SourceTag $source.Tag
+        }
+
+        foreach ($directory in @('sessions', 'attachments', 'memories')) {
+            Sync-StateDirectory -SourceRoot $source.Root -DestinationRoot $NewCodexHome -RelativeDirectory $directory -ConflictRoot $conflictRoot -SourceTag $source.Tag
+        }
+    }
+
+    foreach ($database in @('state_5.sqlite', 'goals_1.sqlite', 'memories_1.sqlite', 'logs_2.sqlite')) {
+        Sync-SqliteStateDatabase -SourceRoots $sourceRoots -DestinationRoot $NewCodexHome -DatabaseName $database -ConflictRoot $conflictRoot
+    }
+
+    Write-Ok 'History/SQLite sync completed'
+}
+
 function Initialize-CodexHome {
     param(
         [string]$OldCodexHome,
@@ -404,6 +797,13 @@ function Repair-CodexConfig {
 
     $lines = Remove-TomlSection -Lines $lines -Section 'marketplaces.openai-bundled'
     $lines = Set-TomlTopLevelKey -Lines $lines -Key 'notify' -Value ("[ {0}, ""turn-ended"" ]" -f (Convert-ToTomlLiteral (Join-Path $nodeModules '@oai\sky\bin\windows\codex-computer-use.exe')))
+    $lines = Set-TomlTopLevelKey -Lines $lines -Key 'approvals_reviewer' -Value '"user"'
+    if (-not $KeepCodexPermissions) {
+        $lines = Set-TomlTopLevelKey -Lines $lines -Key 'approval_policy' -Value '"never"'
+        $lines = Set-TomlTopLevelKey -Lines $lines -Key 'sandbox_mode' -Value '"danger-full-access"'
+        $lines = Set-TomlTopLevelKey -Lines $lines -Key 'default_permissions' -Value '":danger-full-access"'
+        $lines = Set-TomlSectionKey -Lines $lines -Section 'windows' -Key 'sandbox' -Value '"unelevated"'
+    }
     $lines = Set-TomlSectionKey -Lines $lines -Section 'desktop' -Key 'runCodexInWindowsSubsystemForLinux' -Value 'false'
     $lines = Set-TomlSectionKey -Lines $lines -Section 'desktop' -Key 'integratedTerminalShell' -Value '"powershell"'
 
@@ -421,6 +821,67 @@ function Repair-CodexConfig {
 
     if ($PSCmdlet.ShouldProcess($ConfigPath, 'write repaired config.toml')) {
         Set-Content -LiteralPath $ConfigPath -Value $lines -Encoding UTF8
+    }
+}
+
+function Repair-CodexPermissionState {
+    param([string[]]$StatePaths)
+
+    if ($KeepCodexPermissions) {
+        Write-WarnLine 'Keeping existing Codex permission state because -KeepCodexPermissions was provided'
+        return
+    }
+
+    foreach ($statePath in $StatePaths | Select-Object -Unique) {
+        $stateDir = Split-Path -Parent $statePath
+        if (-not (Test-Path -LiteralPath $stateDir)) {
+            continue
+        }
+
+        try {
+            if (Test-Path -LiteralPath $statePath) {
+                $json = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+            } else {
+                $json = [pscustomobject]@{}
+            }
+
+            $atomProp = $json.PSObject.Properties['electron-persisted-atom-state']
+            if ($null -eq $atomProp) {
+                Set-ObjectProperty -Object $json -Name 'electron-persisted-atom-state' -Value ([pscustomobject]@{})
+            }
+            $atom = $json.'electron-persisted-atom-state'
+
+            $modeProp = $atom.PSObject.Properties['agent-mode-by-host-id']
+            if ($null -eq $modeProp) {
+                Set-ObjectProperty -Object $atom -Name 'agent-mode-by-host-id' -Value ([pscustomobject]@{})
+            }
+            Set-ObjectProperty -Object $atom.'agent-mode-by-host-id' -Name 'local' -Value 'full-access'
+            Set-ObjectProperty -Object $atom -Name 'skip-full-access-confirm' -Value $true
+
+            if ($atom.PSObject.Properties['preferred-non-full-access-agent-mode-by-host-id']) {
+                $atom.PSObject.Properties.Remove('preferred-non-full-access-agent-mode-by-host-id')
+            }
+
+            $heartbeatProp = $atom.PSObject.Properties['heartbeat-thread-permissions-by-id']
+            if ($null -ne $heartbeatProp -and $null -ne $heartbeatProp.Value) {
+                foreach ($prop in $heartbeatProp.Value.PSObject.Properties) {
+                    $permission = $prop.Value
+                    if ($null -eq $permission) {
+                        continue
+                    }
+                    Set-ObjectProperty -Object $permission -Name 'activePermissionProfile' -Value ([pscustomobject]@{ id = ':danger-full-access' })
+                    Set-ObjectProperty -Object $permission -Name 'approvalPolicy' -Value 'never'
+                    Set-ObjectProperty -Object $permission -Name 'approvalsReviewer' -Value 'user'
+                    Set-ObjectProperty -Object $permission -Name 'sandboxPolicy' -Value ([pscustomobject]@{ type = 'dangerFullAccess' })
+                }
+            }
+
+            if ($PSCmdlet.ShouldProcess($statePath, 'write full-access Codex permission state')) {
+                $json | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $statePath -Encoding UTF8
+            }
+        } catch {
+            Write-WarnLine "Could not repair Codex permission state ${statePath}: $($_.Exception.Message)"
+        }
     }
 }
 
@@ -680,20 +1141,44 @@ function New-CodexShortcuts {
                 $shortcut.IconLocation = $icon
             }
             $shortcut.Save()
+            if (-not $NoAdminShortcuts) {
+                Set-ShortcutRunAsAdmin -ShortcutPath $target.Path
+            }
+        }
+    }
+}
+
+function Set-ShortcutRunAsAdmin {
+    param([string]$ShortcutPath)
+
+    if (-not (Test-Path -LiteralPath $ShortcutPath)) {
+        return
+    }
+
+    if ($PSCmdlet.ShouldProcess($ShortcutPath, 'set Run as administrator flag')) {
+        $bytes = [System.IO.File]::ReadAllBytes($ShortcutPath)
+        if ($bytes.Length -gt 0x15) {
+            $bytes[0x15] = $bytes[0x15] -bor 0x20
+            [System.IO.File]::WriteAllBytes($ShortcutPath, $bytes)
         }
     }
 }
 
 function Stop-IsolatedCodexProcesses {
-    param([string]$Root)
+    param(
+        [string]$Root,
+        [switch]$Force
+    )
 
-    if (-not $RestartExisting) {
+    if (-not $Force -and -not $RestartExisting) {
         return
     }
 
     $appRoot = Join-Path $Root 'app'
+    $resourceRoot = Join-Path $appRoot 'resources'
     $processes = @(Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -eq 'Codex.exe' -and $_.ExecutablePath -like "$appRoot*"
+        ($_.Name -eq 'Codex.exe' -and $_.ExecutablePath -like "$appRoot*") -or
+        ($_.Name -eq 'codex.exe' -and $_.ExecutablePath -like "$resourceRoot*")
     })
     if ($processes.Count -eq 0) {
         return
@@ -704,6 +1189,20 @@ function Stop-IsolatedCodexProcesses {
         Stop-Process -Id $ids -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 3
     }
+}
+
+function Get-CodexPermissionStatePaths {
+    param(
+        [string]$OldCodexHome,
+        [string]$NewCodexHome
+    )
+
+    return @(
+        (Join-Path $OldCodexHome '.codex-global-state.json'),
+        (Join-Path $OldCodexHome '.codex-global-state.json.bak'),
+        (Join-Path $NewCodexHome '.codex-global-state.json'),
+        (Join-Path $NewCodexHome '.codex-global-state.json.bak')
+    )
 }
 
 function Test-IsolatedCli {
@@ -719,6 +1218,54 @@ function Test-IsolatedCli {
         throw "Isolated CLI failed: $output"
     }
     Write-Ok "Isolated CLI: $output"
+}
+
+function Test-FullAccessConfig {
+    param([string]$Root)
+
+    if ($KeepCodexPermissions) {
+        return
+    }
+
+    $codexHome = Join-Path $Root 'data\CodexHome'
+    $configPath = Join-Path $codexHome 'config.toml'
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        throw "Missing isolated config.toml: $configPath"
+    }
+
+    $config = Get-Content -LiteralPath $configPath -Raw
+    $checks = @(
+        @{ Name = 'approval_policy'; Pass = ($config -match '(?m)^\s*approval_policy\s*=\s*"never"\s*$') },
+        @{ Name = 'sandbox_mode'; Pass = ($config -match '(?m)^\s*sandbox_mode\s*=\s*"danger-full-access"\s*$') },
+        @{ Name = 'default_permissions'; Pass = ($config -match '(?m)^\s*default_permissions\s*=\s*":danger-full-access"\s*$') },
+        @{ Name = 'windows sandbox'; Pass = ($config -match '(?s)\[windows\].*?sandbox\s*=\s*"unelevated"') }
+    )
+    foreach ($check in $checks) {
+        if (-not $check.Pass) {
+            throw "Full-access config check failed: $($check.Name)"
+        }
+    }
+
+    $statePath = Join-Path $codexHome '.codex-global-state.json'
+    if (Test-Path -LiteralPath $statePath) {
+        $json = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        $atomProp = $json.PSObject.Properties['electron-persisted-atom-state']
+        if ($null -eq $atomProp) {
+            Write-WarnLine 'Codex global state has no electron persisted atom state; relying on pinned config.toml permissions'
+        } else {
+            $atom = $atomProp.Value
+            $modeProp = $atom.PSObject.Properties['agent-mode-by-host-id']
+            $skipProp = $atom.PSObject.Properties['skip-full-access-confirm']
+            if ($null -eq $modeProp -or $modeProp.Value.local -ne 'full-access') {
+                Write-WarnLine 'Codex global state does not report local=full-access; relying on pinned config.toml permissions'
+            }
+            if ($null -eq $skipProp -or $skipProp.Value -ne $true) {
+                Write-WarnLine 'Codex global state does not report skip-full-access-confirm=true; relying on pinned config.toml permissions'
+            }
+        }
+    }
+
+    Write-Ok 'Full-access Codex config is pinned'
 }
 
 function Start-IsolatedCodex {
@@ -838,9 +1385,13 @@ New-Directory -Path (Join-Path $dataDir 'Temp')
 New-Directory -Path (Join-Path $dataDir 'Home')
 New-Directory -Path (Join-Path $dataDir 'CodexDesktopProfile')
 
+Stop-IsolatedCodexProcesses -Root $InstallRoot
 Invoke-RobocopyMirror -Source $packageInfo.SourceApp -Destination $appDir
 Initialize-CodexHome -OldCodexHome $oldCodexHome -NewCodexHome $codexHome
+Sync-CodexState -OldCodexHome $oldCodexHome -NewCodexHome $codexHome -Backup $backup
 Repair-CodexConfig -ConfigPath (Join-Path $codexHome 'config.toml') -InstallRoot $InstallRoot -PackageVersion $packageInfo.Version
+$permissionStatePaths = Get-CodexPermissionStatePaths -OldCodexHome $oldCodexHome -NewCodexHome $codexHome
+Repair-CodexPermissionState -StatePaths $permissionStatePaths
 
 $nativeHostPaths = @(
     (Join-Path $oldCodexHome 'chrome-native-hosts-v2.json'),
@@ -858,7 +1409,6 @@ Write-LauncherFiles -Root $InstallRoot
 Set-IsolatedEnvironment -Root $InstallRoot
 Send-EnvironmentBroadcast
 New-CodexShortcuts -Root $InstallRoot
-Stop-IsolatedCodexProcesses -Root $InstallRoot
 
 if ($WhatIfPreference) {
     Write-Ok 'WhatIf completed; no changes were applied and runtime validation was skipped'
@@ -866,8 +1416,17 @@ if ($WhatIfPreference) {
 }
 
 Test-IsolatedCli -Root $InstallRoot
+Test-FullAccessConfig -Root $InstallRoot
 Start-IsolatedCodex -Root $InstallRoot
 Test-IsolatedDesktop -Root $InstallRoot
+if (-not $NoLaunch -and -not $KeepCodexPermissions) {
+    Stop-IsolatedCodexProcesses -Root $InstallRoot -Force
+    Repair-CodexPermissionState -StatePaths $permissionStatePaths
+    Test-FullAccessConfig -Root $InstallRoot
+    Start-IsolatedCodex -Root $InstallRoot
+    Test-IsolatedDesktop -Root $InstallRoot
+    Test-FullAccessConfig -Root $InstallRoot
+}
 Test-RecentLogs -Root $InstallRoot
 
 Write-Ok 'Codex Desktop isolation repair completed'

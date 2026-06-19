@@ -2,7 +2,13 @@
 
 Repair helper for a broken Windows Codex Desktop install where the MSIX/Store
 package, stale CLI paths, WSL app-server mode, or locked plugin cache prevents
-Codex from starting correctly.
+Codex from starting correctly. It also pins Codex to full-access/no-approval
+mode and avoids the Windows Agent sandbox updater path that can show:
+
+```text
+Couldn't update Agent sandbox
+Retry the update to continue
+```
 
 The script creates an isolated Codex Desktop copy under:
 
@@ -42,6 +48,19 @@ Repair without launching Codex:
 powershell -ExecutionPolicy Bypass -File .\Repair-CodexDesktop.ps1 -NoLaunch
 ```
 
+Keep the existing Codex permission/sandbox profile instead of forcing
+full-access/no-approval:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Repair-CodexDesktop.ps1 -KeepCodexPermissions
+```
+
+Skip history and SQLite migration/sync:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Repair-CodexDesktop.ps1 -NoStateSync
+```
+
 ## What It Fixes
 
 - Copies the current `OpenAI.Codex` MSIX app payload out of `WindowsApps`.
@@ -52,10 +71,24 @@ powershell -ExecutionPolicy Bypass -File .\Repair-CodexDesktop.ps1 -NoLaunch
   - removes `CODEX_SQLITE_HOME`
 - Prepends `%USERPROFILE%\Apps\CodexDesktop\bin` to the user `PATH`.
 - Disables WSL app-server mode in the isolated `config.toml`.
+- Pins Codex permissions unless `-KeepCodexPermissions` is used:
+  - `approval_policy="never"`
+  - `sandbox_mode="danger-full-access"`
+  - `default_permissions=":danger-full-access"`
+  - `[windows] sandbox="unelevated"` to avoid the Agent sandbox updater failure
+- Updates persisted Codex Desktop state to skip the full-access confirmation.
+- Imports legacy history/state into the isolated Codex home unless `-NoStateSync`
+  is used:
+  - merges `history.jsonl` and `session_index.jsonl` without duplicate lines
+  - copies missing `sessions`, `attachments`, and `memories` files
+  - treats SQLite state as atomic `.sqlite/.sqlite-wal/.sqlite-shm` sets
+  - resolves conflicts deterministically: newer state wins, the losing copy is
+    saved under the run backup's `conflicts` directory
 - Rewrites stale local runtime paths inside isolated config/native-host files.
 - Creates Desktop and Start Menu shortcuts:
   - `Codex Desktop (Isolated)`
   - `Codex Desktop (Isolated GPU Safe)`
+- Marks shortcuts to run as administrator unless `-NoAdminShortcuts` is used.
 - Launches Codex with:
 
 ```text
@@ -64,8 +97,13 @@ Codex.exe --app=...\resources\app.asar --user-data-dir=...\data\CodexDesktopProf
 
 ## Safety
 
-The script does not upload anything. It only writes local files and HKCU user
-environment variables.
+The script does not upload anything. It only writes local files, HKCU user
+environment variables, and local shortcuts.
+
+By default it enables Codex full-access/no-approval mode and administrator
+shortcuts because that is the failure mode this helper targets. Use
+`-KeepCodexPermissions` and/or `-NoAdminShortcuts` if you do not want those
+settings changed.
 
 Before changing files it creates a backup under:
 
@@ -73,8 +111,14 @@ Before changing files it creates a backup under:
 %USERPROFILE%\CodexDesktopAutofixBackup\<timestamp>
 ```
 
-Backups may contain local Codex configuration. They are intentionally ignored
-by this repository and should not be committed or shared.
+Backups may contain local Codex configuration, history, transcripts, memories,
+and SQLite databases. They are intentionally ignored by this repository and
+should not be committed or shared.
+
+The isolated Codex home is the active target after repair. The script imports
+legacy `%USERPROFILE%\.codex` state into it, but it does not destructively
+overwrite the legacy home. If two copies differ, the chosen active copy is based
+on modification time and the losing copy is preserved in `conflicts`.
 
 The script avoids:
 
@@ -93,6 +137,7 @@ Do not paste or upload these files in GitHub issues:
 - any copied `auth.json` under the isolated `CodexHome`
 - raw `config.toml` if it contains provider keys, MCP env vars, private commands, or private paths
 - raw `HKCU-Environment.reg`
+- backup `conflicts` directories
 - SQLite databases, session logs, transcripts, or `.codex-global-state.json`
 - command output containing API keys, `GH_TOKEN`, `GITHUB_TOKEN`, `github_pat_`, `ghp_`, `sk-`, cookies, bearer tokens, or proxy credentials
 
