@@ -61,6 +61,12 @@ Skip history and SQLite migration/sync:
 powershell -ExecutionPolicy Bypass -File .\Repair-CodexDesktop.ps1 -NoStateSync
 ```
 
+Disable self-elevating desktop launchers:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Repair-CodexDesktop.ps1 -NoAdminLaunchers
+```
+
 ## What It Fixes
 
 - Copies the current `OpenAI.Codex` MSIX app payload out of `WindowsApps`.
@@ -88,6 +94,8 @@ powershell -ExecutionPolicy Bypass -File .\Repair-CodexDesktop.ps1 -NoStateSync
 - Creates Desktop and Start Menu shortcuts:
   - `Codex Desktop (Isolated)`
   - `Codex Desktop (Isolated GPU Safe)`
+- Makes Desktop launchers self-elevate through UAC unless
+  `-NoAdminLaunchers` is used.
 - Marks shortcuts to run as administrator unless `-NoAdminShortcuts` is used.
 - Launches Codex with:
 
@@ -100,10 +108,10 @@ Codex.exe --app=...\resources\app.asar --user-data-dir=...\data\CodexDesktopProf
 The script does not upload anything. It only writes local files, HKCU user
 environment variables, and local shortcuts.
 
-By default it enables Codex full-access/no-approval mode and administrator
-shortcuts because that is the failure mode this helper targets. Use
-`-KeepCodexPermissions` and/or `-NoAdminShortcuts` if you do not want those
-settings changed.
+By default it enables Codex full-access/no-approval mode, self-elevating
+launchers, and administrator shortcuts because that is the failure mode this
+helper targets. Use `-KeepCodexPermissions`, `-NoAdminLaunchers`, and/or
+`-NoAdminShortcuts` if you do not want those settings changed.
 
 Before changing files it creates a backup under:
 

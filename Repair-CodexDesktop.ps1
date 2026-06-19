@@ -8,6 +8,7 @@ param(
     [switch]$GpuSafe,
     [switch]$NoShortcuts,
     [switch]$NoAdminShortcuts,
+    [switch]$NoAdminLaunchers,
     [switch]$KeepCodexPermissions,
     [switch]$NoStateSync,
     [switch]$SelfTest
@@ -569,6 +570,7 @@ function Get-SqliteSetInfo {
 
     $paths = @($main, "$main-wal", "$main-shm") | Where-Object { Test-Path -LiteralPath $_ }
     $items = @($paths | ForEach-Object { Get-Item -LiteralPath $_ })
+    $mainItem = Get-Item -LiteralPath $main
     $latest = ($items | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
     $totalBytes = ($items | Measure-Object -Property Length -Sum).Sum
 
@@ -577,6 +579,7 @@ function Get-SqliteSetInfo {
         DatabaseName = $DatabaseName
         Tag = $Tag
         Paths = $paths
+        MainLatest = $mainItem.LastWriteTimeUtc
         Latest = $latest
         TotalBytes = [int64]$totalBytes
     }
@@ -673,7 +676,14 @@ function Sync-SqliteStateDatabase {
         return
     }
 
-    $winner = $candidateInfos | Sort-Object Latest, TotalBytes -Descending | Select-Object -First 1
+    if ($DatabaseName -eq 'state_5.sqlite') {
+        # WAL/SHM mtimes can be advanced by another Codex surface and are not a
+        # reliable signal for the canonical chat index. Prefer the active main
+        # database file so recent isolated Desktop chats are not hidden.
+        $winner = $candidateInfos | Sort-Object MainLatest, TotalBytes -Descending | Select-Object -First 1
+    } else {
+        $winner = $candidateInfos | Sort-Object Latest, TotalBytes -Descending | Select-Object -First 1
+    }
     $destinationSignature = Get-SqliteSetSignature -Root $DestinationRoot -DatabaseName $DatabaseName
 
     foreach ($candidate in $candidateInfos) {
@@ -978,6 +988,74 @@ function Write-LauncherFiles {
     $bin = Join-Path $Root 'bin'
     New-Directory -Path $bin
 
+    if ($NoAdminLaunchers) {
+        $desktopCmd = @'
+@echo off
+setlocal
+call "%~dp0codex-env.cmd"
+start "Codex Desktop Isolated" /D "%CODEX_APP%" "%CODEX_APP%\Codex.exe" --app="%CODEX_APP%\resources\app.asar" --user-data-dir="%CODEX_DATA%\CodexDesktopProfile" --no-first-run %*
+'@
+        $desktopSafeGpuCmd = @'
+@echo off
+setlocal
+call "%~dp0codex-env.cmd"
+start "Codex Desktop Isolated GPU Safe" /D "%CODEX_APP%" "%CODEX_APP%\Codex.exe" --app="%CODEX_APP%\resources\app.asar" --user-data-dir="%CODEX_DATA%\CodexDesktopProfile" --no-first-run --disable-gpu %*
+'@
+        $desktopVbs = @'
+Set shell = CreateObject("WScript.Shell")
+scriptDir = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
+shell.Run """" & scriptDir & "\codex-desktop.cmd" & """", 0, False
+'@
+        $desktopSafeGpuVbs = @'
+Set shell = CreateObject("WScript.Shell")
+scriptDir = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
+shell.Run """" & scriptDir & "\codex-desktop-safe-gpu.cmd" & """", 0, False
+'@
+    } else {
+        $desktopCmd = @'
+@echo off
+setlocal
+call "%~dp0codex-env.cmd"
+if /I not "%CODEX_SKIP_ELEVATE%"=="1" (
+  fltmc >nul 2>nul
+  if errorlevel 1 (
+    set "CODEX_SKIP_ELEVATE=1"
+    set "CODEX_DESKTOP_CMD=%~f0"
+    set "CODEX_DESKTOP_ARGS=%*"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$cmd=$env:CODEX_DESKTOP_CMD; $argLine=$env:CODEX_DESKTOP_ARGS; $argList='/c ""' + $cmd + '""'; if ($argLine) { $argList += ' ' + $argLine }; Start-Process -FilePath $env:ComSpec -ArgumentList $argList -WorkingDirectory (Split-Path -Parent $cmd) -Verb RunAs -WindowStyle Hidden"
+    exit /b
+  )
+)
+start "Codex Desktop Isolated" /D "%CODEX_APP%" "%CODEX_APP%\Codex.exe" --app="%CODEX_APP%\resources\app.asar" --user-data-dir="%CODEX_DATA%\CodexDesktopProfile" --no-first-run --do-not-de-elevate %*
+'@
+        $desktopSafeGpuCmd = @'
+@echo off
+setlocal
+call "%~dp0codex-env.cmd"
+if /I not "%CODEX_SKIP_ELEVATE%"=="1" (
+  fltmc >nul 2>nul
+  if errorlevel 1 (
+    set "CODEX_SKIP_ELEVATE=1"
+    set "CODEX_DESKTOP_CMD=%~f0"
+    set "CODEX_DESKTOP_ARGS=%*"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$cmd=$env:CODEX_DESKTOP_CMD; $argLine=$env:CODEX_DESKTOP_ARGS; $argList='/c ""' + $cmd + '""'; if ($argLine) { $argList += ' ' + $argLine }; Start-Process -FilePath $env:ComSpec -ArgumentList $argList -WorkingDirectory (Split-Path -Parent $cmd) -Verb RunAs -WindowStyle Hidden"
+    exit /b
+  )
+)
+start "Codex Desktop Isolated GPU Safe" /D "%CODEX_APP%" "%CODEX_APP%\Codex.exe" --app="%CODEX_APP%\resources\app.asar" --user-data-dir="%CODEX_DATA%\CodexDesktopProfile" --no-first-run --disable-gpu --do-not-de-elevate %*
+'@
+        $desktopVbs = @'
+Set app = CreateObject("Shell.Application")
+scriptDir = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
+app.ShellExecute scriptDir & "\codex-desktop.cmd", "", scriptDir, "runas", 0
+'@
+        $desktopSafeGpuVbs = @'
+Set app = CreateObject("Shell.Application")
+scriptDir = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
+app.ShellExecute scriptDir & "\codex-desktop-safe-gpu.cmd", "", scriptDir, "runas", 0
+'@
+    }
+
     $files = @{
         'codex-env.cmd' = @'
 @echo off
@@ -1002,18 +1080,8 @@ set "XDG_CACHE_HOME=%CODEX_HOME%\xdg-cache"
 set "XDG_DATA_HOME=%CODEX_HOME%\xdg-data"
 set "PATH=%CODEX_APP%\resources;%CODEX_APP%\resources\cua_node\bin;%PATH%"
 '@
-        'codex-desktop.cmd' = @'
-@echo off
-setlocal
-call "%~dp0codex-env.cmd"
-start "Codex Desktop Isolated" /D "%CODEX_APP%" "%CODEX_APP%\Codex.exe" --app="%CODEX_APP%\resources\app.asar" --user-data-dir="%CODEX_DATA%\CodexDesktopProfile" --no-first-run %*
-'@
-        'codex-desktop-safe-gpu.cmd' = @'
-@echo off
-setlocal
-call "%~dp0codex-env.cmd"
-start "Codex Desktop Isolated GPU Safe" /D "%CODEX_APP%" "%CODEX_APP%\Codex.exe" --app="%CODEX_APP%\resources\app.asar" --user-data-dir="%CODEX_DATA%\CodexDesktopProfile" --no-first-run --disable-gpu %*
-'@
+        'codex-desktop.cmd' = $desktopCmd
+        'codex-desktop-safe-gpu.cmd' = $desktopSafeGpuCmd
         'codex-cli.cmd' = @'
 @echo off
 call "%~dp0codex-env.cmd"
@@ -1023,16 +1091,8 @@ call "%~dp0codex-env.cmd"
 @echo off
 call "%~dp0codex-cli.cmd" %*
 '@
-        'codex-desktop.vbs' = @'
-Set shell = CreateObject("WScript.Shell")
-scriptDir = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
-shell.Run """" & scriptDir & "\codex-desktop.cmd" & """", 0, False
-'@
-        'codex-desktop-safe-gpu.vbs' = @'
-Set shell = CreateObject("WScript.Shell")
-scriptDir = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
-shell.Run """" & scriptDir & "\codex-desktop-safe-gpu.cmd" & """", 0, False
-'@
+        'codex-desktop.vbs' = $desktopVbs
+        'codex-desktop-safe-gpu.vbs' = $desktopSafeGpuVbs
     }
 
     foreach ($entry in $files.GetEnumerator()) {
