@@ -651,6 +651,269 @@ function Copy-SqliteSet {
     }
 }
 
+function Ensure-WinSqliteType {
+    if ('CodexDesktopAutofix.WinSqlite3' -as [type]) {
+        return
+    }
+
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace CodexDesktopAutofix {
+    public static class WinSqlite3 {
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int sqlite3_open_v2(byte[] filename, out IntPtr db, int flags, IntPtr zVfs);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int sqlite3_prepare_v2(IntPtr db, byte[] sql, int nByte, out IntPtr stmt, IntPtr pzTail);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int sqlite3_step(IntPtr stmt);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int sqlite3_column_count(IntPtr stmt);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr sqlite3_column_name(IntPtr stmt, int iCol);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int sqlite3_column_type(IntPtr stmt, int iCol);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr sqlite3_column_text(IntPtr stmt, int iCol);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern long sqlite3_column_int64(IntPtr stmt, int iCol);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern double sqlite3_column_double(IntPtr stmt, int iCol);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int sqlite3_finalize(IntPtr stmt);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int sqlite3_close(IntPtr db);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr sqlite3_errmsg(IntPtr db);
+
+        public static string PtrToStringUtf8(IntPtr ptr) {
+            if (ptr == IntPtr.Zero) {
+                return null;
+            }
+            int len = 0;
+            while (Marshal.ReadByte(ptr, len) != 0) {
+                len++;
+            }
+            if (len == 0) {
+                return String.Empty;
+            }
+            byte[] buffer = new byte[len];
+            Marshal.Copy(ptr, buffer, 0, len);
+            return Encoding.UTF8.GetString(buffer);
+        }
+    }
+}
+'@
+}
+
+function Invoke-WinSqliteQuery {
+    param(
+        [string]$DatabasePath,
+        [string]$Sql
+    )
+
+    Ensure-WinSqliteType
+
+    $sqlite = [CodexDesktopAutofix.WinSqlite3]
+    $ok = 0
+    $row = 100
+    $done = 101
+    $openReadOnly = 1
+    $openUri = 64
+
+    $db = [IntPtr]::Zero
+    $stmt = [IntPtr]::Zero
+    $databaseBytes = [System.Text.Encoding]::UTF8.GetBytes($DatabasePath + [char]0)
+    $rc = $sqlite::sqlite3_open_v2($databaseBytes, [ref]$db, ($openReadOnly -bor $openUri), [IntPtr]::Zero)
+    if ($rc -ne $ok) {
+        $message = if ($db -ne [IntPtr]::Zero) { $sqlite::PtrToStringUtf8($sqlite::sqlite3_errmsg($db)) } else { "code $rc" }
+        if ($db -ne [IntPtr]::Zero) {
+            [void]$sqlite::sqlite3_close($db)
+        }
+        throw "sqlite open failed for ${DatabasePath}: $message"
+    }
+
+    try {
+        $sqlBytes = [System.Text.Encoding]::UTF8.GetBytes($Sql + [char]0)
+        $rc = $sqlite::sqlite3_prepare_v2($db, $sqlBytes, -1, [ref]$stmt, [IntPtr]::Zero)
+        if ($rc -ne $ok) {
+            $message = $sqlite::PtrToStringUtf8($sqlite::sqlite3_errmsg($db))
+            throw "sqlite prepare failed for ${DatabasePath}: $message"
+        }
+
+        $columns = @()
+        for ($i = 0; $i -lt $sqlite::sqlite3_column_count($stmt); $i++) {
+            $columns += $sqlite::PtrToStringUtf8($sqlite::sqlite3_column_name($stmt, $i))
+        }
+
+        $items = New-Object System.Collections.Generic.List[object]
+        while ($true) {
+            $rc = $sqlite::sqlite3_step($stmt)
+            if ($rc -eq $done) {
+                break
+            }
+            if ($rc -ne $row) {
+                $message = $sqlite::PtrToStringUtf8($sqlite::sqlite3_errmsg($db))
+                throw "sqlite step failed for ${DatabasePath}: $message"
+            }
+
+            $object = [ordered]@{}
+            for ($i = 0; $i -lt $columns.Count; $i++) {
+                $type = $sqlite::sqlite3_column_type($stmt, $i)
+                $value = $null
+                switch ($type) {
+                    1 { $value = $sqlite::sqlite3_column_int64($stmt, $i) }
+                    2 { $value = $sqlite::sqlite3_column_double($stmt, $i) }
+                    3 { $value = $sqlite::PtrToStringUtf8($sqlite::sqlite3_column_text($stmt, $i)) }
+                    default { $value = $null }
+                }
+                $object[$columns[$i]] = $value
+            }
+            [void]$items.Add([pscustomobject]$object)
+        }
+
+        return $items.ToArray()
+    } finally {
+        if ($stmt -ne [IntPtr]::Zero) {
+            [void]$sqlite::sqlite3_finalize($stmt)
+        }
+        if ($db -ne [IntPtr]::Zero) {
+            [void]$sqlite::sqlite3_close($db)
+        }
+    }
+}
+
+function ConvertTo-SessionIndexName {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return 'Untitled chat'
+    }
+
+    $clean = $Value.Trim() -replace '[\r\n\x85\u2028\u2029]+', ' '
+    $clean = $clean -replace '\s{2,}', ' '
+    if ([string]::IsNullOrWhiteSpace($clean)) {
+        return 'Untitled chat'
+    }
+    return $clean
+}
+
+function Get-ExistingSessionIndexNames {
+    param([string]$IndexPath)
+
+    $names = @{}
+    if (-not (Test-Path -LiteralPath $IndexPath)) {
+        return $names
+    }
+
+    foreach ($line in @(Get-Content -LiteralPath $IndexPath -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+        if ($null -eq $line) {
+            continue
+        }
+        $cleanLine = $line.TrimStart([char]0xfeff)
+        if ($cleanLine.Trim() -eq '') {
+            continue
+        }
+        try {
+            $item = $cleanLine | ConvertFrom-Json
+            if ($item.id -and $item.thread_name) {
+                $names[[string]$item.id] = [string]$item.thread_name
+            }
+        } catch {
+            continue
+        }
+    }
+
+    return $names
+}
+
+function Rebuild-SessionIndexFromSqlite {
+    param(
+        [string]$CodexHome,
+        [string]$ConflictRoot
+    )
+
+    $database = Join-Path $CodexHome 'state_5.sqlite'
+    $indexPath = Join-Path $CodexHome 'session_index.jsonl'
+    if (-not (Test-Path -LiteralPath $database)) {
+        return
+    }
+
+    try {
+        $existingNames = Get-ExistingSessionIndexNames -IndexPath $indexPath
+        $query = @'
+select
+  id,
+  coalesce(nullif(title, ''), nullif(preview, ''), nullif(first_user_message, ''), 'Untitled chat') as thread_name,
+  coalesce(
+    strftime('%Y-%m-%dT%H:%M:%fZ',
+      case
+        when updated_at_ms is not null then updated_at_ms / 1000.0
+        when updated_at is not null then updated_at
+        when created_at_ms is not null then created_at_ms / 1000.0
+        else created_at
+      end,
+      'unixepoch'
+    ),
+    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  ) as updated_at
+from threads
+where coalesce(archived, 0) = 0
+order by coalesce(updated_at_ms, updated_at * 1000, created_at_ms, created_at * 1000) desc
+'@
+        $threads = @(Invoke-WinSqliteQuery -DatabasePath $database -Sql $query)
+        if ($threads.Count -eq 0) {
+            return
+        }
+
+        $lines = New-Object System.Collections.Generic.List[string]
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($thread in $threads) {
+            $id = [string]$thread.id
+            if ([string]::IsNullOrWhiteSpace($id) -or -not $seen.Add($id)) {
+                continue
+            }
+
+            $name = if ($existingNames.ContainsKey($id)) { $existingNames[$id] } else { [string]$thread.thread_name }
+            $item = [pscustomobject]@{
+                id = $id
+                thread_name = ConvertTo-SessionIndexName -Value $name
+                updated_at = [string]$thread.updated_at
+            }
+            [void]$lines.Add(($item | ConvertTo-Json -Compress))
+        }
+
+        if ($lines.Count -eq 0) {
+            return
+        }
+
+        if (Test-Path -LiteralPath $indexPath) {
+            Copy-ConflictSnapshot -Source $indexPath -SourceRoot $CodexHome -ConflictRoot $ConflictRoot -Tag 'isolated-before-session-index-rebuild'
+        }
+
+        if ($PSCmdlet.ShouldProcess($indexPath, "rebuild session_index.jsonl from $database")) {
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllLines($indexPath, [string[]]$lines.ToArray(), $utf8NoBom)
+            Write-Ok "Rebuilt session_index.jsonl from SQLite ($($lines.Count) chats)"
+        }
+    } catch {
+        Write-WarnLine "Could not rebuild session_index.jsonl from SQLite: $($_.Exception.Message)"
+    }
+}
+
 function Sync-SqliteStateDatabase {
     param(
         [object[]]$SourceRoots,
@@ -745,6 +1008,7 @@ function Sync-CodexState {
         Sync-SqliteStateDatabase -SourceRoots $sourceRoots -DestinationRoot $NewCodexHome -DatabaseName $database -ConflictRoot $conflictRoot
     }
 
+    Rebuild-SessionIndexFromSqlite -CodexHome $NewCodexHome -ConflictRoot $conflictRoot
     Write-Ok 'History/SQLite sync completed'
 }
 

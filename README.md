@@ -90,6 +90,8 @@ powershell -ExecutionPolicy Bypass -File .\Repair-CodexDesktop.ps1 -NoAdminLaunc
   - treats SQLite state as atomic `.sqlite/.sqlite-wal/.sqlite-shm` sets
   - resolves conflicts deterministically: newer state wins, the losing copy is
     saved under the run backup's `conflicts` directory
+  - rebuilds `session_index.jsonl` from `state_5.sqlite` after the merge so
+    recovered chats are visible in the Desktop sidebar
 - Rewrites stale local runtime paths inside isolated config/native-host files.
 - Creates Desktop and Start Menu shortcuts:
   - `Codex Desktop (Isolated)`
